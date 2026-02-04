@@ -642,7 +642,7 @@ class SpeedTestWorker(QThread):
     status_message = Signal(str)
     speed_test_completed = Signal(list)
     
-    def __init__(self, results: List[Dict], region_code: str = None, current_port=443):
+    def __init__(self, results: List[Dict], region_code: str = None, current_port=443, auto_region_mode: bool = False):
         super().__init__()
         self.results = results
         self.region_code = region_code.upper() if region_code else None
@@ -651,6 +651,8 @@ class SpeedTestWorker(QThread):
         self.test_host = "speed.cloudflare.com"
         self.running = True
         self.current_port = current_port
+        # auto_region_mode=True 表示“区域测速”按钮触发的模式
+        self.auto_region_mode = auto_region_mode
     
     def download_speed(self, ip: str, port: int) -> float:
         ctx = ssl.create_default_context()
@@ -714,6 +716,10 @@ class SpeedTestWorker(QThread):
                 filtered_results = [r for r in self.results if r.get('iata_code') and r['iata_code'].upper() == self.region_code]
                 self.status_message.emit(f"开始地区测速：{self.region_code} ({AIRPORT_CODES.get(self.region_code, '未知地区')}) (端口: {self.current_port})")
                 self.status_message.emit(f"找到 {len(filtered_results)} 个 {self.region_code} 地区的IP")
+            elif self.auto_region_mode:
+                # 区域测速：由外部提前按地区选好候选 IP，这里整体测速
+                filtered_results = self.results
+                self.status_message.emit(f"开始区域测速 (端口: {self.current_port})")
             else:
                 filtered_results = self.results
                 self.status_message.emit(f"开始完全测速 (端口: {self.current_port})")
@@ -726,7 +732,12 @@ class SpeedTestWorker(QThread):
             filtered_results.sort(key=lambda x: x.get('latency', float('inf')))
             target_ips = filtered_results[:min(10, len(filtered_results))]
             
-            test_type = "地区测速" if self.region_code else "完全测速"
+            if self.region_code:
+                test_type = "指定测速"
+            elif self.auto_region_mode:
+                test_type = "区域测速"
+            else:
+                test_type = "完全测速"
             self.status_message.emit(f"{test_type}：将对 {len(target_ips)} 个IP进行测速")
             
             speed_results = []
@@ -1032,11 +1043,17 @@ class CloudflareScanUI(QWidget):
         self.btn_full = self.make_btn("完全测速", "#F97316", enabled=False)
         self.btn_full.clicked.connect(self.start_full_speed_test)
         
-        self.btn_area = self.make_btn("地区测速", "#EC4899", enabled=False)
+        # 新增“区域测速”按钮：自动按地区分组、保留每区前三
+        self.btn_region_auto = self.make_btn("区域测速", "#0EA5E9", enabled=False)
+        self.btn_region_auto.clicked.connect(self.start_auto_region_speed_test)
+        
+        # 原“地区测速”改为“指定测速”：根据输入的地区码测速
+        self.btn_area = self.make_btn("指定测速", "#EC4899", enabled=False)
         self.btn_area.clicked.connect(self.start_region_speed_test)
 
         row2.addWidget(self.btn_stop)
         row2.addWidget(self.btn_full)
+        row2.addWidget(self.btn_region_auto)
         row2.addWidget(self.btn_area)
 
         row3 = QHBoxLayout()
@@ -1364,6 +1381,54 @@ class CloudflareScanUI(QWidget):
         
         self.speed_test_worker.start()
     
+    def start_auto_region_speed_test(self):
+        """区域测速：对所有已扫描可用 IP，按地区分组后分别测速，并保留每区前三。"""
+        if self.speed_testing or self.scanning:
+            return
+        
+        if not self.scan_results:
+            self.status_display.append("错误：请先运行扫描获取IP列表！")
+            return
+        
+        # 按地区分组已扫描结果
+        region_groups: Dict[str, List[Dict]] = {}
+        for r in self.scan_results:
+            code = (r.get("iata_code") or "UNKNOWN").upper()
+            if not code or code == "UNKNOWN":
+                code = "UNKNOWN"
+            region_groups.setdefault(code, []).append(r)
+
+        if not region_groups:
+            self.status_display.append("错误：扫描结果中没有可用的地区信息，无法进行区域测速。")
+            return
+
+        # 为每个地区挑选少量延迟较低的候选 IP，以控制总测速数量
+        selected_results: List[Dict] = []
+        for code, items in region_groups.items():
+            items_sorted = sorted(items, key=lambda x: x.get("latency", float("inf")))
+            # 每个地区最多取 6 个做测速候选
+            selected_results.extend(items_sorted[: min(6, len(items_sorted))])
+
+        self.speed_testing = True
+        self.update_ui_state(task_started=True)
+        
+        self.speed_table.setRowCount(0)
+        self.status_display.append("")
+        self.status_display.append(f"区域测速：共 {len(region_groups)} 个地区，候选 IP 数量 {len(selected_results)} 个")
+        
+        self.progress_bar.setValue(0)
+        self.status_label.setText("区域测速中...")
+        self.speed_label.setText("测速进度: 0/5")
+        
+        # 区域测速模式：在 SpeedTestWorker 中使用 auto_region_mode 标记
+        self.speed_test_worker = SpeedTestWorker(selected_results, current_port=self.current_scan_port, auto_region_mode=True)
+        self.speed_test_worker.progress_update.connect(self.update_speed_test_progress)
+        self.speed_test_worker.status_message.connect(self.update_status_message)
+        self.speed_test_worker.speed_test_completed.connect(self.speed_test_finished)
+        self.speed_test_worker.finished.connect(lambda: self.worker_finished("speed_test"))
+        
+        self.speed_test_worker.start()
+    
     def start_region_speed_test(self):
         if self.speed_testing or self.scanning:
             return
@@ -1374,7 +1439,7 @@ class CloudflareScanUI(QWidget):
         
         region_code = self.input_region.text().strip().upper()
         if not region_code:
-            self.status_display.append("错误：请输入地区码（如SJC、SIN等）")
+            self.status_display.append("错误：请输入地区码（如 SJC、SIN 等）")
             return
         
         if region_code not in AIRPORT_CODES:
@@ -1387,9 +1452,10 @@ class CloudflareScanUI(QWidget):
         self.status_display.append("")
         
         self.progress_bar.setValue(0)
-        self.status_label.setText(f"{region_code}地区测速中...")
+        self.status_label.setText(f"{region_code} 指定测速中...")
         self.speed_label.setText("测速进度: 0/5")
         
+        # 指定地区测速：传入地区码，只测速该地区
         self.speed_test_worker = SpeedTestWorker(self.scan_results, region_code, current_port=self.current_scan_port)
         self.speed_test_worker.progress_update.connect(self.update_speed_test_progress)
         self.speed_test_worker.status_message.connect(self.update_status_message)
@@ -1451,6 +1517,13 @@ class CloudflareScanUI(QWidget):
             return False
         test_type = str(results[0].get("test_type", "")).strip()
         return test_type == "完全测速"
+
+    def is_auto_region_speed_results(self, results: List[Dict]) -> bool:
+        """区域测速结果识别：test_type == 区域测速。"""
+        if not results:
+            return False
+        test_type = str(results[0].get("test_type", "")).strip()
+        return test_type == "区域测速"
 
     def keep_top_n_per_region(self, results: List[Dict], n: int = 3) -> List[Dict]:
         """将测速结果按地区分组，保留每个地区下载速度最快的 n 个。"""
@@ -1594,9 +1667,10 @@ class CloudflareScanUI(QWidget):
         self.show_scan_summary(results)
     
     def speed_test_finished(self, results):
-        # 根据用户设置，在完全测速结果上按地区保留每区最快 3 个
-        if results and self.keep_top3_per_region_full_test and self.is_full_speed_test_results(results):
-            results = self.keep_top_n_per_region(results, n=3)
+        # 完全测速：可选“每区前三”；区域测速：始终保留每区前三
+        if results:
+            if (self.keep_top3_per_region_full_test and self.is_full_speed_test_results(results)) or self.is_auto_region_speed_results(results):
+                results = self.keep_top_n_per_region(results, n=3)
 
         self.speed_results = results
         self.add_speed_results_to_table(results)
@@ -1626,6 +1700,7 @@ class CloudflareScanUI(QWidget):
             self.btn_ipv4.setEnabled(False)
             self.btn_ipv6.setEnabled(False)
             self.btn_full.setEnabled(False)
+            self.btn_region_auto.setEnabled(False)
             self.btn_area.setEnabled(False)
             self.btn_export.setEnabled(False)
             self.btn_gist.setEnabled(False)
@@ -1637,6 +1712,7 @@ class CloudflareScanUI(QWidget):
             self.combo_port.setEnabled(True)
             if self.scan_results:
                 self.btn_full.setEnabled(True)
+                self.btn_region_auto.setEnabled(True)
                 self.btn_area.setEnabled(True)
             if self.speed_results:
                 self.btn_export.setEnabled(True)
