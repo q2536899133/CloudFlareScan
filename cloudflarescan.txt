@@ -1440,7 +1440,136 @@ class CloudflareScanUI(QWidget):
             
         except Exception as e:
             self.status_display.append(f"导出失败: {str(e)}")
-    
+
+    def on_top3_region_changed(self, state: int):
+        # 勾选时，在“完全测速”结果上按地区保留每区最快 3 个
+        self.keep_top3_per_region_full_test = (state == Qt.Checked)
+
+    def is_full_speed_test_results(self, results: List[Dict]) -> bool:
+        """仅在完全测速结果上应用“每区前三”筛选，避免影响地区测速。"""
+        if not results:
+            return False
+        test_type = str(results[0].get("test_type", "")).strip()
+        return test_type == "完全测速"
+
+    def keep_top_n_per_region(self, results: List[Dict], n: int = 3) -> List[Dict]:
+        """将测速结果按地区分组，保留每个地区下载速度最快的 n 个。"""
+        groups: Dict[str, List[Dict]] = {}
+        for r in results:
+            code = (r.get("iata_code") or "UNKNOWN").upper()
+            if not code or code == "UNKNOWN":
+                code = "UNKNOWN"
+            groups.setdefault(code, []).append(r)
+
+        trimmed: List[Dict] = []
+        for code, items in groups.items():
+            items_sorted = sorted(
+                items,
+                key=lambda x: (
+                    -float(x.get("download_speed", 0) or 0),
+                    float(x.get("latency", 1e9) or 1e9),
+                    str(x.get("ip", "")),
+                ),
+            )
+            trimmed.extend(items_sorted[: max(0, int(n))])
+
+        def region_sort_key(x: Dict):
+            code = (x.get("iata_code") or "UNKNOWN").upper()
+            name = str(x.get("chinese_name") or "")
+            return (name, code, -float(x.get("download_speed", 0) or 0), float(x.get("latency", 1e9) or 1e9))
+
+        return sorted(trimmed, key=region_sort_key)
+
+    def build_csv_text(self, results: List[Dict]) -> str:
+        """生成与导出 CSV 相同结构的文本，用于上传 Gist。"""
+        output_lines = []
+        header = ['排名', 'IP地址', '地区码', '地区', '延迟', '下载速度', '端口', '测速类型']
+        output_lines.append(",".join(header))
+
+        for i, result in enumerate(results, 1):
+            row = [
+                str(i),
+                str(result.get('ip', '')),
+                str(result.get('iata_code', '')),
+                str(result.get('chinese_name', '')),
+                f"{float(result.get('latency', 0) or 0):.2f}",
+                f"{float(result.get('download_speed', 0) or 0):.2f}",
+                str(result.get('port', 443)),
+                str(result.get('test_type', '未知')),
+            ]
+            escaped = []
+            for v in row:
+                s = "" if v is None else str(v)
+                if any(c in s for c in [",", '"', "\n", "\r"]):
+                    s = '"' + s.replace('"', '""') + '"'
+                escaped.append(s)
+            output_lines.append(",".join(escaped))
+
+        return "\n".join(output_lines) + "\n"
+
+    def save_results_to_gist(self):
+        if not self.speed_results:
+            self.status_display.append("错误：没有测速结果可以保存到 Gist！")
+            return
+
+        token = self.input_gist_token.text().strip()
+        if not token:
+            self.status_display.append("错误：请先输入 Gist Token（需要 gist 权限）")
+            return
+
+        csv_text = self.build_csv_text(self.speed_results)
+        filename = f"cfs_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        description = f"CloudflareScan 测速结果 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+        payload = {
+            "description": description,
+            "public": False,
+            "files": {
+                filename: {"content": csv_text}
+            },
+        }
+
+        req = urllib.request.Request(
+            "https://api.github.com/gists",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "cloudflarescan",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            self.status_display.append("正在保存到 Gist...")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                data = json.loads(body) if body else {}
+                html_url = data.get("html_url") or ""
+                gist_id = data.get("id") or ""
+
+            if html_url:
+                self.status_display.append(f"Gist 保存成功：{html_url}")
+                self.status_label.setText("Gist 已保存")
+            else:
+                self.status_display.append("Gist 创建成功，但未返回链接（请检查返回数据）")
+                self.status_label.setText("Gist 已保存")
+
+            if gist_id:
+                self.status_display.append(f"Gist ID: {gist_id}")
+
+            QTimer.singleShot(3000, lambda: self.status_label.setText("就绪"))
+
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                err_body = ""
+            self.status_display.append(f"Gist 保存失败（HTTP {e.code}）：{err_body or e.reason}")
+        except Exception as e:
+            self.status_display.append(f"Gist 保存失败：{str(e)}")
+
     def stop_all_tasks(self):
         if self.ipv4_scan_worker and self.scanning:
             self.ipv4_scan_worker.stop()
@@ -1465,11 +1594,16 @@ class CloudflareScanUI(QWidget):
         self.show_scan_summary(results)
     
     def speed_test_finished(self, results):
+        # 根据用户设置，在完全测速结果上按地区保留每区最快 3 个
+        if results and self.keep_top3_per_region_full_test and self.is_full_speed_test_results(results):
+            results = self.keep_top_n_per_region(results, n=3)
+
         self.speed_results = results
         self.add_speed_results_to_table(results)
         
         if results:
             self.btn_export.setEnabled(True)
+            self.btn_gist.setEnabled(True)
     
     def worker_finished(self, worker_type):
         if worker_type == "scan":
@@ -1494,6 +1628,7 @@ class CloudflareScanUI(QWidget):
             self.btn_full.setEnabled(False)
             self.btn_area.setEnabled(False)
             self.btn_export.setEnabled(False)
+            self.btn_gist.setEnabled(False)
             self.combo_port.setEnabled(False)
         else:
             self.btn_stop.setEnabled(False)
@@ -1503,6 +1638,9 @@ class CloudflareScanUI(QWidget):
             if self.scan_results:
                 self.btn_full.setEnabled(True)
                 self.btn_area.setEnabled(True)
+            if self.speed_results:
+                self.btn_export.setEnabled(True)
+                self.btn_gist.setEnabled(True)
             
             self.progress_bar.setValue(0)
     
