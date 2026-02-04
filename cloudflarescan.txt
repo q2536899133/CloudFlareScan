@@ -712,79 +712,170 @@ class SpeedTestWorker(QThread):
                 self.speed_test_completed.emit([])
                 return
             
-            if self.region_code:
-                filtered_results = [r for r in self.results if r.get('iata_code') and r['iata_code'].upper() == self.region_code]
-                self.status_message.emit(f"开始地区测速：{self.region_code} ({AIRPORT_CODES.get(self.region_code, '未知地区')}) (端口: {self.current_port})")
-                self.status_message.emit(f"找到 {len(filtered_results)} 个 {self.region_code} 地区的IP")
-            elif self.auto_region_mode:
-                # 区域测速：由外部提前按地区选好候选 IP，这里整体测速
-                filtered_results = self.results
-                self.status_message.emit(f"开始区域测速 (端口: {self.current_port})")
-            else:
-                filtered_results = self.results
-                self.status_message.emit(f"开始完全测速 (端口: {self.current_port})")
-            
-            if not filtered_results:
-                self.status_message.emit(f"没有找到可用的IP进行测速")
-                self.speed_test_completed.emit([])
-                return
-            
-            filtered_results.sort(key=lambda x: x.get('latency', float('inf')))
-            target_ips = filtered_results[:min(10, len(filtered_results))]
-            
-            if self.region_code:
-                test_type = "指定测速"
-            elif self.auto_region_mode:
-                test_type = "区域测速"
-            else:
-                test_type = "完全测速"
-            self.status_message.emit(f"{test_type}：将对 {len(target_ips)} 个IP进行测速")
-            
-            speed_results = []
-            
-            for i, ip_info in enumerate(target_ips):
-                if not self.running:
-                    break
-                
-                ip = ip_info['ip']
+            def build_speed_result(ip_info: Dict, download_speed: float, test_type: str) -> Dict:
+                ip = ip_info.get('ip', '')
                 latency = ip_info.get('latency', 0)
-                
-                self.status_message.emit(f"[{i+1}/{len(target_ips)}] 正在测速 {ip} (延迟: {latency}ms) (端口: {self.current_port})")
-                self.progress_update.emit(i+1, len(target_ips), 0)
-                
-                download_speed = self.download_speed(ip, self.current_port)
-                
                 colo = get_iata_code_from_ip(ip, timeout=3)
                 if not colo or colo == "Unknown":
                     colo = ip_info.get('iata_code', 'UNKNOWN')
-                
-                speed_result = {
+                colo = (colo or 'UNKNOWN').upper()
+                return {
                     'ip': ip,
                     'latency': latency,
                     'download_speed': download_speed,
-                    'iata_code': colo.upper() if colo else 'UNKNOWN',
-                    'chinese_name': AIRPORT_CODES.get(colo.upper(), '未知地区') if colo else '未知地区',
+                    'iata_code': colo,
+                    'chinese_name': AIRPORT_CODES.get(colo, '未知地区') if colo else '未知地区',
                     'test_type': test_type,
-                    'port': self.current_port  
+                    'port': self.current_port
                 }
-                
+
+            # 指定测速：只测某一个地区
+            if self.region_code:
+                filtered_results = [r for r in self.results if r.get('iata_code') and r['iata_code'].upper() == self.region_code]
+                self.status_message.emit(f"开始指定测速：{self.region_code} ({AIRPORT_CODES.get(self.region_code, '未知地区')}) (端口: {self.current_port})")
+                self.status_message.emit(f"找到 {len(filtered_results)} 个 {self.region_code} 地区的IP")
+                if not filtered_results:
+                    self.status_message.emit("没有找到可用的IP进行测速")
+                    self.speed_test_completed.emit([])
+                    return
+
+                filtered_results.sort(key=lambda x: x.get('latency', float('inf')))
+                target_ips = filtered_results[:min(10, len(filtered_results))]
+                test_type = "指定测速"
+                self.status_message.emit(f"{test_type}：将对 {len(target_ips)} 个IP进行测速")
+
+                speed_results: List[Dict] = []
+                for i, ip_info in enumerate(target_ips):
+                    if not self.running:
+                        break
+                    ip = ip_info['ip']
+                    latency = ip_info.get('latency', 0)
+                    self.status_message.emit(f"[{i+1}/{len(target_ips)}] 正在测速 {ip} (延迟: {latency}ms) (端口: {self.current_port})")
+                    self.progress_update.emit(i+1, len(target_ips), 0)
+                    download_speed = self.download_speed(ip, self.current_port)
+                    speed_result = build_speed_result(ip_info, download_speed, test_type)
+                    speed_results.append(speed_result)
+                    self.status_message.emit(f"  测速结果: {download_speed} MB/s, 地区: {speed_result['chinese_name']}")
+                    if i < len(target_ips) - 1:
+                        for _ in range(self.download_interval * 10):
+                            if not self.running:
+                                break
+                            time.sleep(0.1)
+
+                speed_results.sort(key=lambda x: x['download_speed'], reverse=True)
+                if speed_results:
+                    self.status_message.emit(f"测速完成！成功测速 {len(speed_results)}/{len(target_ips)} 个IP")
+                else:
+                    self.status_message.emit("所有IP测速失败")
+                self.speed_test_completed.emit(speed_results)
+                return
+
+            # 区域测速：按地区分别测速，每区保留最快 3 个
+            if self.auto_region_mode:
+                test_type = "区域测速"
+                self.status_message.emit(f"开始区域测速 (端口: {self.current_port})")
+
+                groups: Dict[str, List[Dict]] = {}
+                for r in self.results:
+                    code = (r.get('iata_code') or 'UNKNOWN').upper()
+                    if not code or code == "UNKNOWN":
+                        code = "UNKNOWN"
+                    groups.setdefault(code, []).append(r)
+
+                # 为每个地区取“延迟最低”的候选进行测速（最多 10 个/地区）
+                candidates_by_region: Dict[str, List[Dict]] = {}
+                total_candidates = 0
+                for code, items in groups.items():
+                    items_sorted = sorted(items, key=lambda x: x.get('latency', float('inf')))
+                    candidates = items_sorted[:min(10, len(items_sorted))]
+                    if candidates:
+                        candidates_by_region[code] = candidates
+                        total_candidates += len(candidates)
+
+                if total_candidates == 0:
+                    self.status_message.emit("没有找到可用的IP进行测速")
+                    self.speed_test_completed.emit([])
+                    return
+
+                self.status_message.emit(f"{test_type}：将对 {len(candidates_by_region)} 个地区共 {total_candidates} 个候选IP进行测速（每区最多 10 个候选，输出每区 Top3）")
+
+                completed = 0
+                speed_results: List[Dict] = []
+                for code, candidates in sorted(candidates_by_region.items(), key=lambda x: x[0]):
+                    if not self.running:
+                        break
+                    region_name = AIRPORT_CODES.get(code, '未知地区') if code else '未知地区'
+                    self.status_message.emit(f"---- 地区 {code}（{region_name}）：候选 {len(candidates)} 个 ----")
+
+                    region_speed_results: List[Dict] = []
+                    for ip_info in candidates:
+                        if not self.running:
+                            break
+                        completed += 1
+                        ip = ip_info.get('ip', '')
+                        latency = ip_info.get('latency', 0)
+                        self.status_message.emit(f"[{completed}/{total_candidates}] 正在测速 {ip} (延迟: {latency}ms) (端口: {self.current_port})")
+                        self.progress_update.emit(completed, total_candidates, 0)
+                        download_speed = self.download_speed(ip, self.current_port)
+                        speed_result = build_speed_result(ip_info, download_speed, test_type)
+                        region_speed_results.append(speed_result)
+                        self.status_message.emit(f"  测速结果: {download_speed} MB/s")
+
+                        for _ in range(self.download_interval * 5):
+                            if not self.running:
+                                break
+                            time.sleep(0.1)
+
+                    # 每区保留 Top3
+                    region_speed_results.sort(key=lambda x: x.get('download_speed', 0), reverse=True)
+                    top3 = region_speed_results[:3]
+                    speed_results.extend(top3)
+                    self.status_message.emit(f"地区 {code} Top3 已选出：{len(top3)} 个")
+
+                speed_results.sort(key=lambda x: (x.get('chinese_name', ''), x.get('iata_code', ''), -(x.get('download_speed', 0) or 0)))
+                if speed_results:
+                    self.status_message.emit(f"{test_type}完成：输出 {len(speed_results)} 条结果（每区最多 3 条）")
+                else:
+                    self.status_message.emit("所有IP测速失败")
+                self.speed_test_completed.emit(speed_results)
+                return
+
+            # 完全测速：不分区，取全局延迟最低的前 10 个测速
+            filtered_results = self.results
+            self.status_message.emit(f"开始完全测速 (端口: {self.current_port})")
+            filtered_results.sort(key=lambda x: x.get('latency', float('inf')))
+            target_ips = filtered_results[:min(10, len(filtered_results))]
+            if not target_ips:
+                self.status_message.emit("没有找到可用的IP进行测速")
+                self.speed_test_completed.emit([])
+                return
+
+            test_type = "完全测速"
+            self.status_message.emit(f"{test_type}：将对 {len(target_ips)} 个IP进行测速")
+
+            speed_results: List[Dict] = []
+            for i, ip_info in enumerate(target_ips):
+                if not self.running:
+                    break
+                ip = ip_info['ip']
+                latency = ip_info.get('latency', 0)
+                self.status_message.emit(f"[{i+1}/{len(target_ips)}] 正在测速 {ip} (延迟: {latency}ms) (端口: {self.current_port})")
+                self.progress_update.emit(i+1, len(target_ips), 0)
+                download_speed = self.download_speed(ip, self.current_port)
+                speed_result = build_speed_result(ip_info, download_speed, test_type)
                 speed_results.append(speed_result)
-                
                 self.status_message.emit(f"  测速结果: {download_speed} MB/s, 地区: {speed_result['chinese_name']}")
-                
                 if i < len(target_ips) - 1:
                     for _ in range(self.download_interval * 10):
                         if not self.running:
                             break
                         time.sleep(0.1)
-            
+
             speed_results.sort(key=lambda x: x['download_speed'], reverse=True)
-            
             if speed_results:
                 self.status_message.emit(f"测速完成！成功测速 {len(speed_results)}/{len(target_ips)} 个IP")
             else:
-                self.status_message.emit(f"所有IP测速失败")
-            
+                self.status_message.emit("所有IP测速失败")
             self.speed_test_completed.emit(speed_results)
             
         except Exception as e:
