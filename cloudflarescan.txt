@@ -1689,6 +1689,20 @@ class CloudflareScanUI(QWidget):
 
         return "\n".join(output_lines) + "\n"
 
+    def build_gist_txt_text(self, results: List[Dict]) -> str:
+        """生成 Gist 用 TXT 内容：每行  ip#地区码#下载速度"""
+        lines = []
+        for r in results:
+            ip = str(r.get("ip", "")).strip()
+            iata = str(r.get("iata_code", "")).strip() or "UNKNOWN"
+            speed = r.get("download_speed")
+            if speed is None:
+                speed_str = "0"
+            else:
+                speed_str = f"{float(speed):.2f}"
+            lines.append(f"{ip}#{iata}#{speed_str}")
+        return "\n".join(lines) + "\n"
+
     def save_results_to_gist(self):
         if not self.speed_results:
             self.status_display.append("错误：没有测速结果可以保存到 Gist！")
@@ -1699,8 +1713,8 @@ class CloudflareScanUI(QWidget):
             self.status_display.append("错误：请先输入 Gist Token（需要 gist 权限）")
             return
 
-        csv_text = self.build_csv_text(self.speed_results)
-        filename = "cfs.csv"
+        gist_text = self.build_gist_txt_text(self.speed_results)
+        filename = "cfs.txt"
         gist_id = self.input_gist_id.text().strip()
 
         headers = {
@@ -1712,17 +1726,17 @@ class CloudflareScanUI(QWidget):
 
         try:
             if gist_id:
-                self.status_display.append("正在更新 Gist（覆盖 cfs.csv）...")
-                payload = {"files": {filename: {"content": csv_text}}}
+                self.status_display.append("正在更新 Gist（覆盖 cfs.txt）...")
+                payload = {"files": {filename: {"content": gist_text}}}
                 url = f"https://api.github.com/gists/{gist_id}"
                 req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="PATCH", headers=headers)
             else:
-                self.status_display.append("正在保存到 Gist（新建 cfs.csv）...")
+                self.status_display.append("正在保存到 Gist（新建 cfs.txt）...")
                 description = f"CloudflareScan 测速结果 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 payload = {
                     "description": description,
                     "public": False,
-                    "files": {filename: {"content": csv_text}},
+                    "files": {filename: {"content": gist_text}},
                 }
                 req = urllib.request.Request(
                     "https://api.github.com/gists",
@@ -1746,7 +1760,7 @@ class CloudflareScanUI(QWidget):
 
             if new_id and not gist_id:
                 self.input_gist_id.setText(new_id)
-                self.status_display.append(f"Gist ID 已填入，下次保存将覆盖该 Gist 的 cfs.csv")
+                self.status_display.append(f"Gist ID 已填入，下次保存将覆盖该 Gist 的 cfs.txt")
             if new_id:
                 self.status_display.append(f"Gist ID: {new_id}")
 
